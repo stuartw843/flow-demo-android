@@ -50,7 +50,7 @@ class AssistantActivity : AppCompatActivity() {
     // Retry and Delay Constants
     private val MAX_RETRIES = 3
     private val RETRY_DELAY_MS = 2000L
-    private val START_DELAY_MS = 1000L
+    private val START_DELAY_MS = 0L
 
     // View Binding
     private lateinit var binding: ActivityAssistantBinding
@@ -103,21 +103,20 @@ class AssistantActivity : AppCompatActivity() {
     // Queue to buffer audio data until conversation starts
     private val audioDataQueue = LinkedBlockingQueue<ByteArray>()
 
-    @SuppressLint("NewApi")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
         // Set up window flags to work over lock screen
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
             setShowWhenLocked(true)
             setTurnScreenOn(true)
             val keyguardManager = getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
             keyguardManager.requestDismissKeyguard(this, null)
         } else {
+            @Suppress("DEPRECATION")
             window.addFlags(
-                WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD or
+                WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON or
+                        WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD or
                         WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
                         WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
             )
@@ -150,7 +149,8 @@ class AssistantActivity : AppCompatActivity() {
     @SuppressLint("NewApi")
     private fun setupAudioSystem() {
         audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
-        audioManager.setSpeakerphoneOn(false)
+        @Suppress("DEPRECATION")
+        audioManager.isSpeakerphoneOn = false
 
         val focusRequest =
             AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE)
@@ -287,8 +287,8 @@ class AssistantActivity : AppCompatActivity() {
             override fun onResponse(call: Call, response: Response) {
                 if (response.isSuccessful) {
                     val responseBody = response.body?.string()
-                    val jsonObject = JSONObject(responseBody)
-                    val jwtToken = jsonObject.getString("key_value")
+                    val jsonObject = JSONObject(responseBody ?: "{}")
+                    val jwtToken = jsonObject.optString("key_value", null.toString())
                     callback(jwtToken)
                 } else {
                     callback(null)
@@ -486,7 +486,11 @@ class AssistantActivity : AppCompatActivity() {
             try {
                 while (isAssistantRunning && isConversationStarted && audioDataQueue.isNotEmpty()) {
                     val data = audioDataQueue.poll()
-                    sendAudioData(data)
+                    if (data != null) {
+                        sendAudioData(data)
+                    } else {
+                        break
+                    }
                 }
             } catch (e: Exception) {
                 e.printStackTrace()
@@ -508,9 +512,17 @@ class AssistantActivity : AppCompatActivity() {
     private fun playAudioFromQueue() {
         executorService.execute {
             isPlayingAudio = true
-            while (audioChunkQueue.isNotEmpty()) {
-                val data = audioChunkQueue.poll()
-                playAudio(data)
+            try {
+                while (audioChunkQueue.isNotEmpty()) {
+                    val data = audioChunkQueue.poll()
+                    if (data != null) {
+                        playAudio(data)
+                    } else {
+                        break
+                    }
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
             }
             isPlayingAudio = false
         }
@@ -541,7 +553,7 @@ class AssistantActivity : AppCompatActivity() {
             AudioTrack.MODE_STREAM,
             audioManager.generateAudioSessionId()
         ).apply {
-            setVolume(0.8f)
+            //setVolume(0.8f)
             play()
         }
     }
@@ -633,7 +645,8 @@ class AssistantActivity : AppCompatActivity() {
         webSocket = null
 
         audioManager.mode = AudioManager.MODE_NORMAL
-        audioManager.setSpeakerphoneOn(true)
+        @Suppress("DEPRECATION")
+        audioManager.isSpeakerphoneOn = true
 
         audioFocusRequest?.let { request ->
             audioManager.abandonAudioFocusRequest(request)
@@ -660,8 +673,12 @@ class AssistantActivity : AppCompatActivity() {
     override fun onPause() {
         super.onPause()
         stopAssistant()
+        if (wakeLock.isHeld) {
+            wakeLock.release()
+        }
     }
 
+    @SuppressLint("Wakelock")
     override fun onDestroy() {
         super.onDestroy()
         stopAssistant()
