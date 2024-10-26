@@ -3,6 +3,8 @@ package com.example.flowassistant
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.app.KeyguardManager
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.*
@@ -11,9 +13,11 @@ import android.media.audiofx.NoiseSuppressor
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.util.Log
 import android.view.Menu
 import android.view.MenuItem
+import android.view.WindowManager
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
@@ -51,7 +55,7 @@ class AssistantActivity : AppCompatActivity() {
     // Retry and Delay Constants
     private val MAX_RETRIES = 3
     private val RETRY_DELAY_MS = 2000L
-    private val START_DELAY_MS = 500L
+    private val START_DELAY_MS = 1000L
 
     // View Binding
     private lateinit var binding: ActivityAssistantBinding
@@ -66,6 +70,10 @@ class AssistantActivity : AppCompatActivity() {
     private val executorService = Executors.newFixedThreadPool(2)
     private lateinit var audioManager: AudioManager
     private var audioFocusRequest: AudioFocusRequest? = null
+
+    // Lock screen and wake management
+    private lateinit var wakeLock: PowerManager.WakeLock
+    private lateinit var keyguardManager: KeyguardManager
 
     // Audio Processing State
     @Volatile
@@ -95,6 +103,25 @@ class AssistantActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // Set up window flags to work over lock screen
+        window.addFlags(
+            WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON or
+            WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD or
+            WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
+            WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
+        )
+
+        // Initialize wake lock
+        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        wakeLock = powerManager.newWakeLock(
+            PowerManager.PARTIAL_WAKE_LOCK,
+            "FlowAssistant::AssistantWakeLock"
+        )
+        wakeLock.acquire(10*60*1000L) // 10 minutes timeout
+
+        // Initialize keyguard manager
+        keyguardManager = getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
 
         binding = ActivityAssistantBinding.inflate(layoutInflater)
         setContentView(binding.root)
@@ -410,7 +437,6 @@ class AssistantActivity : AppCompatActivity() {
         }
     }
 
-    // Audio Processing Functions
     private fun processAudioData(buffer: ByteArray): ByteArray {
         if (!isAssistantSpeaking) {
             return buffer
@@ -609,6 +635,11 @@ class AssistantActivity : AppCompatActivity() {
         audioFocusRequest?.let { request ->
             audioManager.abandonAudioFocusRequest(request)
         }
+
+        // Release wake lock if held
+        if (wakeLock.isHeld) {
+            wakeLock.release()
+        }
         
         Log.d("AssistantActivity", "Assistant stopped.")
     }
@@ -622,6 +653,9 @@ class AssistantActivity : AppCompatActivity() {
         super.onDestroy()
         stopAssistant()
         executorService.shutdownNow()
+        if (wakeLock.isHeld) {
+            wakeLock.release()
+        }
     }
 
     override fun onCreateOptionsMenu(menu: Menu?): Boolean {
