@@ -29,6 +29,8 @@ import org.json.JSONObject
 import java.io.IOException
 import java.util.*
 import java.util.concurrent.Executors
+import kotlin.math.abs
+import kotlin.math.sqrt
 
 class AssistantActivity : AppCompatActivity() {
 
@@ -39,10 +41,17 @@ class AssistantActivity : AppCompatActivity() {
     private val AUDIO_FORMAT = AudioFormat.ENCODING_PCM_16BIT
     private val CHANNEL_CONFIG = AudioFormat.CHANNEL_IN_MONO
 
+    // Audio Processing Constants
+    private val NOISE_GATE_THRESHOLD = 2000 // Adjustable threshold for noise gate
+    private val ASSISTANT_FREQ_MIN = 200 // Minimum frequency of assistant's voice (Hz)
+    private val ASSISTANT_FREQ_MAX = 3400 // Maximum frequency of assistant's voice (Hz)
+    private val FFT_SIZE = 2048 // Size for FFT analysis
+    private val ENERGY_THRESHOLD = 0.3f // Energy threshold for voice detection
+
     // Retry and Delay Constants
     private val MAX_RETRIES = 3
-    private val RETRY_DELAY_MS = 2000L // 2 seconds delay between retries
-    private val START_DELAY_MS = 500L  // 0.5 seconds delay at the start of the app
+    private val RETRY_DELAY_MS = 2000L
+    private val START_DELAY_MS = 500L
 
     // View Binding
     private lateinit var binding: ActivityAssistantBinding
@@ -55,6 +64,16 @@ class AssistantActivity : AppCompatActivity() {
     private var webSocket: WebSocket? = null
     private val client = OkHttpClient()
     private val executorService = Executors.newFixedThreadPool(2)
+    private lateinit var audioManager: AudioManager
+    private var audioFocusRequest: AudioFocusRequest? = null
+
+    // Audio Processing State
+    @Volatile
+    private var isAssistantSpeaking = false
+    private val shortBuffer = ShortArray(FFT_SIZE)
+    private val floatBuffer = FloatArray(FFT_SIZE)
+    private var lastRmsValue = 0f
+    private val fftBuffer = FloatArray(FFT_SIZE)
 
     // Assistant State
     @Volatile
@@ -77,21 +96,49 @@ class AssistantActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Initialize View Binding
         binding = ActivityAssistantBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
         val toolbar = binding.assistantToolbar
         setSupportActionBar(toolbar)
 
+        // Initialize AudioManager
+        audioManager = getSystemService(AUDIO_SERVICE) as AudioManager
+        setupAudioSystem()
+
         checkAndRequestPermissions()
+    }
+
+    @SuppressLint("NewApi")
+    private fun setupAudioSystem() {
+        audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+        audioManager.isSpeakerphoneOn = false
+        
+        val focusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE)
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build()
+            )
+            .setAcceptsDelayedFocusGain(true)
+            .setOnAudioFocusChangeListener { focusChange ->
+                when (focusChange) {
+                    AudioManager.AUDIOFOCUS_LOSS,
+                    AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
+                        stopAssistant()
+                    }
+                }
+            }
+            .build()
+        
+        audioFocusRequest = focusRequest
+        audioManager.requestAudioFocus(focusRequest)
     }
 
     override fun onResume() {
         super.onResume()
-        // Only start the assistant if it's not already running
         if (!isAssistantRunning) {
-            // Add a wait before starting the assistant
             Handler(Looper.getMainLooper()).postDelayed({
                 checkApiKey()
             }, START_DELAY_MS)
@@ -146,23 +193,20 @@ class AssistantActivity : AppCompatActivity() {
     private fun startAssistant() {
         synchronized(this) {
             if (isAssistantRunning) {
-                // Assistant is already running, do not start a new session
                 Log.d("AssistantActivity", "Assistant already running.")
                 return
             }
             isAssistantRunning = true
         }
 
-        // Fetch a new JWT token before each connection attempt
         fetchJwtToken { jwtToken ->
             if (jwtToken != null) {
                 startWebSocket(jwtToken)
-                // Start recording after conversation starts
                 startRecording()
                 updateStatusText("Listening...")
             } else {
                 updateStatusText("Error fetching token")
-                isAssistantRunning = false // Reset the flag if there's an error
+                isAssistantRunning = false
             }
         }
     }
@@ -287,7 +331,6 @@ class AssistantActivity : AppCompatActivity() {
     @SuppressLint("MissingPermission")
     private fun startRecording() {
         if (isRecording) {
-            // Already recording
             Log.d("AssistantActivity", "Already recording audio.")
             return
         }
@@ -308,30 +351,20 @@ class AssistantActivity : AppCompatActivity() {
             return
         }
 
-        // Enable Acoustic Echo Canceler
         if (AcousticEchoCanceler.isAvailable()) {
             val echoCanceler = AcousticEchoCanceler.create(audioRecord.audioSessionId)
             if (echoCanceler != null) {
                 echoCanceler.enabled = true
                 Log.d("AssistantActivity", "Acoustic Echo Canceler enabled.")
-            } else {
-                Log.e("AssistantActivity", "Failed to create Acoustic Echo Canceler.")
             }
-        } else {
-            Log.e("AssistantActivity", "Acoustic Echo Canceler not available.")
         }
 
-        // Enable Noise Suppressor
         if (NoiseSuppressor.isAvailable()) {
             val noiseSuppressor = NoiseSuppressor.create(audioRecord.audioSessionId)
             if (noiseSuppressor != null) {
                 noiseSuppressor.enabled = true
                 Log.d("AssistantActivity", "Noise Suppressor enabled.")
-            } else {
-                Log.e("AssistantActivity", "Failed to create Noise Suppressor.")
             }
-        } else {
-            Log.e("AssistantActivity", "Noise Suppressor not available.")
         }
 
         audioRecord.startRecording()
@@ -377,17 +410,101 @@ class AssistantActivity : AppCompatActivity() {
         }
     }
 
+    // Audio Processing Functions
+    private fun processAudioData(buffer: ByteArray): ByteArray {
+        if (!isAssistantSpeaking) {
+            return buffer
+        }
+
+        // Convert byte array to short array
+        for (i in shortBuffer.indices) {
+            if (i * 2 + 1 < buffer.size) {
+                shortBuffer[i] = (buffer[i * 2].toInt() and 0xFF or 
+                               (buffer[i * 2 + 1].toInt() shl 8)).toShort()
+            }
+        }
+
+        // Calculate RMS value
+        var sum = 0.0
+        for (sample in shortBuffer) {
+            sum += (sample * sample).toDouble()
+        }
+        val rms = sqrt(sum / shortBuffer.size).toFloat()
+
+        // Apply noise gate
+        if (rms < NOISE_GATE_THRESHOLD) {
+            return ByteArray(buffer.size)
+        }
+
+        // Convert to float for frequency analysis
+        for (i in floatBuffer.indices) {
+            floatBuffer[i] = shortBuffer[i].toFloat() / Short.MAX_VALUE
+        }
+
+        // Perform frequency analysis
+        analyzeFrequencies(floatBuffer)
+
+        // Check if the dominant frequencies are in the assistant's range
+        if (isAssistantFrequencyRange()) {
+            return ByteArray(buffer.size) // Suppress audio in assistant frequency range
+        }
+
+        return buffer
+    }
+
+    private fun analyzeFrequencies(samples: FloatArray) {
+        // Apply Hanning window
+        for (i in samples.indices) {
+            val multiplier = 0.5f * (1 - kotlin.math.cos(2.0 * Math.PI * i / (samples.size - 1)))
+            fftBuffer[i] = samples[i] * multiplier.toFloat()
+        }
+
+        // Perform FFT (simplified implementation)
+        for (k in 0 until samples.size / 2) {
+            var realSum = 0f
+            var imagSum = 0f
+            for (n in samples.indices) {
+                val angle = 2.0 * Math.PI * k * n / samples.size
+                realSum += fftBuffer[n] * kotlin.math.cos(angle).toFloat()
+                imagSum -= fftBuffer[n] * kotlin.math.sin(angle).toFloat()
+            }
+            val magnitude = sqrt(realSum * realSum + imagSum * imagSum)
+            fftBuffer[k] = magnitude
+        }
+    }
+
+    private fun isAssistantFrequencyRange(): Boolean {
+        val binSize = SAMPLE_RATE.toFloat() / FFT_SIZE
+        val minBin = (ASSISTANT_FREQ_MIN / binSize).toInt()
+        val maxBin = (ASSISTANT_FREQ_MAX / binSize).toInt()
+        
+        var totalEnergy = 0f
+        var rangeEnergy = 0f
+        
+        for (i in 0 until FFT_SIZE / 2) {
+            totalEnergy += fftBuffer[i]
+            if (i in minBin..maxBin) {
+                rangeEnergy += fftBuffer[i]
+            }
+        }
+        
+        return if (totalEnergy > 0) {
+            (rangeEnergy / totalEnergy) > ENERGY_THRESHOLD
+        } else {
+            false
+        }
+    }
+
     private fun sendAudioData(data: ByteArray) {
         try {
             if (isAssistantRunning && webSocket != null) {
-                val sent = webSocket?.send(data.toByteString(0, data.size)) ?: false
+                val processedData = processAudioData(data)
+                val sent = webSocket?.send(processedData.toByteString(0, processedData.size)) ?: false
                 if (!sent) {
                     Log.e("AssistantActivity", "Failed to send data over WebSocket.")
                     updateStatusText("Failed to send audio data.")
                     stopAssistant()
                 }
-            } else {
-                Log.e("AssistantActivity", "Cannot send data: Assistant is not running or WebSocket is null.")
             }
         } catch (e: Exception) {
             e.printStackTrace()
@@ -398,12 +515,16 @@ class AssistantActivity : AppCompatActivity() {
     }
 
     private fun handleAudioMessage(bytes: ByteString) {
+        isAssistantSpeaking = true
         val audioData = bytes.toByteArray()
         playAudio(audioData)
     }
 
     private fun playAudio(data: ByteArray) {
         audioTrack.write(data, 0, data.size)
+        Handler(Looper.getMainLooper()).postDelayed({
+            isAssistantSpeaking = false
+        }, 100)
     }
 
     private val audioTrack: AudioTrack by lazy {
@@ -417,6 +538,7 @@ class AssistantActivity : AppCompatActivity() {
             AudioAttributes.Builder()
                 .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
                 .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                .setFlags(AudioAttributes.FLAG_HW_AV_SYNC)
                 .build(),
             AudioFormat.Builder()
                 .setEncoding(AUDIO_FORMAT)
@@ -425,8 +547,9 @@ class AssistantActivity : AppCompatActivity() {
                 .build(),
             bufferSize,
             AudioTrack.MODE_STREAM,
-            AudioManager.AUDIO_SESSION_ID_GENERATE
+            audioManager.generateAudioSessionId()
         ).apply {
+            setVolume(0.8f)
             play()
         }
     }
@@ -439,7 +562,6 @@ class AssistantActivity : AppCompatActivity() {
                 val sessionId = json.optString("id")
                 updateStatusText("Session ID: $sessionId")
                 Log.d("AssistantActivity", "Conversation started with session ID: $sessionId")
-
             }
             "Info" -> {
                 val status = json.optJSONObject("event")?.optString("status")
@@ -468,10 +590,10 @@ class AssistantActivity : AppCompatActivity() {
         }
     }
 
+    @SuppressLint("NewApi")
     private fun stopAssistant() {
         synchronized(this) {
             if (!isAssistantRunning) {
-                // Assistant is already stopped
                 Log.d("AssistantActivity", "Assistant already stopped.")
                 return
             }
@@ -480,6 +602,14 @@ class AssistantActivity : AppCompatActivity() {
         stopRecording()
         webSocket?.close(1000, null)
         webSocket = null
+        
+        audioManager.mode = AudioManager.MODE_NORMAL
+        audioManager.isSpeakerphoneOn = true
+        
+        audioFocusRequest?.let { request ->
+            audioManager.abandonAudioFocusRequest(request)
+        }
+        
         Log.d("AssistantActivity", "Assistant stopped.")
     }
 
