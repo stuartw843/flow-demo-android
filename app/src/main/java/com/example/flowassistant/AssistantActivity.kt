@@ -10,10 +10,12 @@ import android.content.pm.PackageManager
 import android.media.*
 import android.media.audiofx.AcousticEchoCanceler
 import android.media.audiofx.NoiseSuppressor
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
+import android.util.Base64
 import android.util.Log
 import android.view.Menu
 import android.view.MenuItem
@@ -27,14 +29,14 @@ import androidx.security.crypto.MasterKey
 import com.example.flowassistant.databinding.ActivityAssistantBinding
 import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.RequestBody.Companion.toRequestBody
 import okio.ByteString
 import okio.ByteString.Companion.toByteString
 import org.json.JSONObject
 import java.io.IOException
 import java.util.*
 import java.util.concurrent.Executors
-import kotlin.math.abs
-import kotlin.math.sqrt
+import java.util.concurrent.LinkedBlockingQueue
 
 class AssistantActivity : AppCompatActivity() {
 
@@ -44,13 +46,6 @@ class AssistantActivity : AppCompatActivity() {
     private val SAMPLE_RATE = 16000
     private val AUDIO_FORMAT = AudioFormat.ENCODING_PCM_16BIT
     private val CHANNEL_CONFIG = AudioFormat.CHANNEL_IN_MONO
-
-    // Audio Processing Constants
-    private val NOISE_GATE_THRESHOLD = 2000 // Adjustable threshold for noise gate
-    private val ASSISTANT_FREQ_MIN = 200 // Minimum frequency of assistant's voice (Hz)
-    private val ASSISTANT_FREQ_MAX = 3400 // Maximum frequency of assistant's voice (Hz)
-    private val FFT_SIZE = 2048 // Size for FFT analysis
-    private val ENERGY_THRESHOLD = 0.3f // Energy threshold for voice detection
 
     // Retry and Delay Constants
     private val MAX_RETRIES = 3
@@ -75,14 +70,6 @@ class AssistantActivity : AppCompatActivity() {
     private lateinit var wakeLock: PowerManager.WakeLock
     private lateinit var keyguardManager: KeyguardManager
 
-    // Audio Processing State
-    @Volatile
-    private var isAssistantSpeaking = false
-    private val shortBuffer = ShortArray(FFT_SIZE)
-    private val floatBuffer = FloatArray(FFT_SIZE)
-    private var lastRmsValue = 0f
-    private val fftBuffer = FloatArray(FFT_SIZE)
-
     // Assistant State
     @Volatile
     private var isAssistantRunning = false
@@ -101,16 +88,40 @@ class AssistantActivity : AppCompatActivity() {
         )
     }
 
+    // Variables for handling audio playback
+    private val audioChunkQueue: Queue<ByteArray> = LinkedList()
+    @Volatile
+    private var isPlayingAudio = false
+
+    // Variables for handling audio sequence numbers
+    private var audioSequence = 0
+
+    // Flag to indicate if the conversation has started
+    @Volatile
+    private var isConversationStarted = false
+
+    // Queue to buffer audio data until conversation starts
+    private val audioDataQueue = LinkedBlockingQueue<ByteArray>()
+
+    @SuppressLint("NewApi")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
         // Set up window flags to work over lock screen
-        window.addFlags(
-            WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON or
-            WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD or
-            WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
-            WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
-        )
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            setShowWhenLocked(true)
+            setTurnScreenOn(true)
+            val keyguardManager = getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
+            keyguardManager.requestDismissKeyguard(this, null)
+        } else {
+            window.addFlags(
+                WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD or
+                        WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
+                        WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
+            )
+        }
 
         // Initialize wake lock
         val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
@@ -118,7 +129,7 @@ class AssistantActivity : AppCompatActivity() {
             PowerManager.PARTIAL_WAKE_LOCK,
             "FlowAssistant::AssistantWakeLock"
         )
-        wakeLock.acquire(10*60*1000L) // 10 minutes timeout
+        wakeLock.acquire(10 * 60 * 1000L) // 10 minutes timeout
 
         // Initialize keyguard manager
         keyguardManager = getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
@@ -139,26 +150,27 @@ class AssistantActivity : AppCompatActivity() {
     @SuppressLint("NewApi")
     private fun setupAudioSystem() {
         audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
-        audioManager.isSpeakerphoneOn = false
-        
-        val focusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE)
-            .setAudioAttributes(
-                AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                    .build()
-            )
-            .setAcceptsDelayedFocusGain(true)
-            .setOnAudioFocusChangeListener { focusChange ->
-                when (focusChange) {
-                    AudioManager.AUDIOFOCUS_LOSS,
-                    AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
-                        stopAssistant()
+        audioManager.setSpeakerphoneOn(false)
+
+        val focusRequest =
+            AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE)
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                        .build()
+                )
+                .setAcceptsDelayedFocusGain(true)
+                .setOnAudioFocusChangeListener { focusChange ->
+                    when (focusChange) {
+                        AudioManager.AUDIOFOCUS_LOSS,
+                        AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
+                            stopAssistant()
+                        }
                     }
                 }
-            }
-            .build()
-        
+                .build()
+
         audioFocusRequest = focusRequest
         audioManager.requestAudioFocus(focusRequest)
     }
@@ -224,13 +236,17 @@ class AssistantActivity : AppCompatActivity() {
                 return
             }
             isAssistantRunning = true
+            isConversationStarted = false // Reset the flag
+            audioSequence = 0 // Reset audio sequence number
+            audioDataQueue.clear() // Clear any buffered audio data
         }
 
         fetchJwtToken { jwtToken ->
             if (jwtToken != null) {
                 startWebSocket(jwtToken)
+                updateStatusText("Connecting...")
+                // Start recording, but don't send data yet
                 startRecording()
-                updateStatusText("Listening...")
             } else {
                 updateStatusText("Error fetching token")
                 isAssistantRunning = false
@@ -253,10 +269,7 @@ class AssistantActivity : AppCompatActivity() {
             return
         }
 
-        val requestBody = RequestBody.create(
-            "application/json".toMediaTypeOrNull(),
-            "{\"ttl\":500}"
-        )
+        val requestBody = "{\"ttl\":500}".toRequestBody("application/json".toMediaTypeOrNull())
 
         val request = Request.Builder()
             .url("https://mp.speechmatics.com/v1/api_keys?type=flow")
@@ -292,7 +305,7 @@ class AssistantActivity : AppCompatActivity() {
 
         webSocket = client.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
-                Log.d("AssistantActivity", "WebSocket opened.")
+                Log.d("AssistantActivity", "WebSocket connected.")
                 sendStartConversationMessage()
             }
 
@@ -309,7 +322,10 @@ class AssistantActivity : AppCompatActivity() {
                 Log.e("AssistantActivity", "WebSocket error: ${t.message}")
                 updateStatusText("WebSocket error: ${t.message}")
                 if (retryCount < MAX_RETRIES) {
-                    Log.d("AssistantActivity", "Retrying WebSocket connection (${retryCount + 1}/$MAX_RETRIES)")
+                    Log.d(
+                        "AssistantActivity",
+                        "Retrying WebSocket connection (${retryCount + 1}/$MAX_RETRIES)"
+                    )
                     Handler(Looper.getMainLooper()).postDelayed({
                         startWebSocket(jwtToken, retryCount + 1)
                     }, RETRY_DELAY_MS)
@@ -339,7 +355,7 @@ class AssistantActivity : AppCompatActivity() {
         val message = JSONObject().apply {
             put("message", "StartConversation")
             put("conversation_config", JSONObject().apply {
-                put("template_id", "default")
+                put("template_id", "default") // You can change this to use a selected persona if needed
                 put("template_variables", JSONObject().apply {
                     put("timezone", TimeZone.getDefault().id)
                 })
@@ -417,12 +433,18 @@ class AssistantActivity : AppCompatActivity() {
 
     private fun readAudioData() {
         executorService.execute {
-            val buffer = ByteArray(2048)
+            val buffer = ByteArray(1024)
             try {
                 while (isRecording && isAssistantRunning) {
                     val read = audioRecord.read(buffer, 0, buffer.size)
                     if (read > 0) {
-                        sendAudioData(buffer.copyOf(read))
+                        val data = buffer.copyOf(read)
+                        if (isConversationStarted) {
+                            sendAudioData(data)
+                        } else {
+                            // Buffer the data until conversation starts
+                            audioDataQueue.offer(data)
+                        }
                     }
                 }
                 Log.d("AssistantActivity", "Stopped reading audio data.")
@@ -437,100 +459,19 @@ class AssistantActivity : AppCompatActivity() {
         }
     }
 
-    private fun processAudioData(buffer: ByteArray): ByteArray {
-        if (!isAssistantSpeaking) {
-            return buffer
-        }
-
-        // Convert byte array to short array
-        for (i in shortBuffer.indices) {
-            if (i * 2 + 1 < buffer.size) {
-                shortBuffer[i] = (buffer[i * 2].toInt() and 0xFF or 
-                               (buffer[i * 2 + 1].toInt() shl 8)).toShort()
-            }
-        }
-
-        // Calculate RMS value
-        var sum = 0.0
-        for (sample in shortBuffer) {
-            sum += (sample * sample).toDouble()
-        }
-        val rms = sqrt(sum / shortBuffer.size).toFloat()
-
-        // Apply noise gate
-        if (rms < NOISE_GATE_THRESHOLD) {
-            return ByteArray(buffer.size)
-        }
-
-        // Convert to float for frequency analysis
-        for (i in floatBuffer.indices) {
-            floatBuffer[i] = shortBuffer[i].toFloat() / Short.MAX_VALUE
-        }
-
-        // Perform frequency analysis
-        analyzeFrequencies(floatBuffer)
-
-        // Check if the dominant frequencies are in the assistant's range
-        if (isAssistantFrequencyRange()) {
-            return ByteArray(buffer.size) // Suppress audio in assistant frequency range
-        }
-
-        return buffer
-    }
-
-    private fun analyzeFrequencies(samples: FloatArray) {
-        // Apply Hanning window
-        for (i in samples.indices) {
-            val multiplier = 0.5f * (1 - kotlin.math.cos(2.0 * Math.PI * i / (samples.size - 1)))
-            fftBuffer[i] = samples[i] * multiplier.toFloat()
-        }
-
-        // Perform FFT (simplified implementation)
-        for (k in 0 until samples.size / 2) {
-            var realSum = 0f
-            var imagSum = 0f
-            for (n in samples.indices) {
-                val angle = 2.0 * Math.PI * k * n / samples.size
-                realSum += fftBuffer[n] * kotlin.math.cos(angle).toFloat()
-                imagSum -= fftBuffer[n] * kotlin.math.sin(angle).toFloat()
-            }
-            val magnitude = sqrt(realSum * realSum + imagSum * imagSum)
-            fftBuffer[k] = magnitude
-        }
-    }
-
-    private fun isAssistantFrequencyRange(): Boolean {
-        val binSize = SAMPLE_RATE.toFloat() / FFT_SIZE
-        val minBin = (ASSISTANT_FREQ_MIN / binSize).toInt()
-        val maxBin = (ASSISTANT_FREQ_MAX / binSize).toInt()
-        
-        var totalEnergy = 0f
-        var rangeEnergy = 0f
-        
-        for (i in 0 until FFT_SIZE / 2) {
-            totalEnergy += fftBuffer[i]
-            if (i in minBin..maxBin) {
-                rangeEnergy += fftBuffer[i]
-            }
-        }
-        
-        return if (totalEnergy > 0) {
-            (rangeEnergy / totalEnergy) > ENERGY_THRESHOLD
-        } else {
-            false
-        }
-    }
-
     private fun sendAudioData(data: ByteArray) {
         try {
-            if (isAssistantRunning && webSocket != null) {
-                val processedData = processAudioData(data)
-                val sent = webSocket?.send(processedData.toByteString(0, processedData.size)) ?: false
+            if (isAssistantRunning && isConversationStarted && webSocket != null) {
+                audioSequence++
+                val sent = webSocket?.send(data.toByteString()) ?: false
                 if (!sent) {
                     Log.e("AssistantActivity", "Failed to send data over WebSocket.")
                     updateStatusText("Failed to send audio data.")
                     stopAssistant()
                 }
+            } else {
+                // Buffer the data if conversation hasn't started yet
+                audioDataQueue.offer(data)
             }
         } catch (e: Exception) {
             e.printStackTrace()
@@ -540,17 +481,43 @@ class AssistantActivity : AppCompatActivity() {
         }
     }
 
+    private fun startSendingBufferedAudioData() {
+        executorService.execute {
+            try {
+                while (isAssistantRunning && isConversationStarted && audioDataQueue.isNotEmpty()) {
+                    val data = audioDataQueue.poll()
+                    sendAudioData(data)
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+                Log.e("AssistantActivity", "Error sending buffered audio data: ${e.message}")
+                updateStatusText("Error sending audio data.")
+                stopAssistant()
+            }
+        }
+    }
+
     private fun handleAudioMessage(bytes: ByteString) {
-        isAssistantSpeaking = true
         val audioData = bytes.toByteArray()
-        playAudio(audioData)
+        audioChunkQueue.add(audioData)
+        if (!isPlayingAudio) {
+            playAudioFromQueue()
+        }
+    }
+
+    private fun playAudioFromQueue() {
+        executorService.execute {
+            isPlayingAudio = true
+            while (audioChunkQueue.isNotEmpty()) {
+                val data = audioChunkQueue.poll()
+                playAudio(data)
+            }
+            isPlayingAudio = false
+        }
     }
 
     private fun playAudio(data: ByteArray) {
         audioTrack.write(data, 0, data.size)
-        Handler(Looper.getMainLooper()).postDelayed({
-            isAssistantSpeaking = false
-        }, 100)
     }
 
     private val audioTrack: AudioTrack by lazy {
@@ -564,7 +531,6 @@ class AssistantActivity : AppCompatActivity() {
             AudioAttributes.Builder()
                 .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
                 .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                .setFlags(AudioAttributes.FLAG_HW_AV_SYNC)
                 .build(),
             AudioFormat.Builder()
                 .setEncoding(AUDIO_FORMAT)
@@ -588,6 +554,9 @@ class AssistantActivity : AppCompatActivity() {
                 val sessionId = json.optString("id")
                 updateStatusText("Session ID: $sessionId")
                 Log.d("AssistantActivity", "Conversation started with session ID: $sessionId")
+                isConversationStarted = true // Set the flag to true
+                // Start sending any buffered audio data
+                startSendingBufferedAudioData()
             }
             "Info" -> {
                 val status = json.optJSONObject("event")?.optString("status")
@@ -596,7 +565,7 @@ class AssistantActivity : AppCompatActivity() {
                     Log.d("AssistantActivity", "Info status: $it")
                 }
             }
-            "Error", "Warning" -> {
+            "Warning", "Error" -> {
                 val errorMsg = json.optString("reason")
                 updateStatusText("Error: $errorMsg")
                 Log.e("AssistantActivity", "Received error message: $errorMsg")
@@ -606,6 +575,39 @@ class AssistantActivity : AppCompatActivity() {
                 updateStatusText("Conversation ended")
                 Log.d("AssistantActivity", "Conversation ended.")
                 stopAssistant()
+            }
+            else -> {
+                // Handle other messages
+            }
+        }
+
+        // Handle "prompt" messages
+        if (json.has("prompt")) {
+            val promptJson = json.optJSONObject("prompt")
+            promptJson?.let {
+                val prompt = it.optString("prompt")
+                val response = it.optString("response")
+                Log.d("AssistantActivity", "Prompt received: $prompt, Response: $response")
+                // You can update the UI or store prompts here
+            }
+        }
+
+        // Handle "passive" state
+        if (json.has("passive")) {
+            val passive = json.optBoolean("passive")
+            Log.d("AssistantActivity", "Passive state: $passive")
+            // You can update the UI to reflect the passive state
+        }
+
+        // Handle "audio" messages containing base64-encoded audio
+        if (json.has("audio")) {
+            val audioArray = json.optJSONArray("audio")
+            audioArray?.let {
+                for (i in 0 until it.length()) {
+                    val base64String = it.getString(i)
+                    val audioData = Base64.decode(base64String, Base64.DEFAULT)
+                    handleAudioMessage(audioData.toByteString())
+                }
             }
         }
     }
@@ -626,12 +628,13 @@ class AssistantActivity : AppCompatActivity() {
             isAssistantRunning = false
         }
         stopRecording()
+        sendAudioEndedMessage()
         webSocket?.close(1000, null)
         webSocket = null
-        
+
         audioManager.mode = AudioManager.MODE_NORMAL
-        audioManager.isSpeakerphoneOn = true
-        
+        audioManager.setSpeakerphoneOn(true)
+
         audioFocusRequest?.let { request ->
             audioManager.abandonAudioFocusRequest(request)
         }
@@ -640,8 +643,18 @@ class AssistantActivity : AppCompatActivity() {
         if (wakeLock.isHeld) {
             wakeLock.release()
         }
-        
+
         Log.d("AssistantActivity", "Assistant stopped.")
+    }
+
+    private fun sendAudioEndedMessage() {
+        val message = JSONObject().apply {
+            put("message", "AudioEnded")
+            put("last_seq_no", audioSequence)
+        }
+        val messageString = message.toString()
+        Log.d("AssistantActivity", "Sending AudioEnded message: $messageString")
+        webSocket?.send(messageString)
     }
 
     override fun onPause() {
