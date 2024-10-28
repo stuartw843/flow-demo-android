@@ -50,7 +50,7 @@ class AssistantActivity : AppCompatActivity() {
     // Retry and Delay Constants
     private val MAX_RETRIES = 3
     private val RETRY_DELAY_MS = 2000L
-    private val START_DELAY_MS = 0L
+    private val START_DELAY_MS = 1000L
 
     // View Binding
     private lateinit var binding: ActivityAssistantBinding
@@ -103,6 +103,9 @@ class AssistantActivity : AppCompatActivity() {
     // Queue to buffer audio data until conversation starts
     private val audioDataQueue = LinkedBlockingQueue<ByteArray>()
 
+    // Variable to store user's audio output preference
+    private var useSpeakerphone: Boolean = true
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -141,17 +144,19 @@ class AssistantActivity : AppCompatActivity() {
 
         // Initialize AudioManager
         audioManager = getSystemService(AUDIO_SERVICE) as AudioManager
-        setupAudioSystem()
+
+        // Read user's audio output preference
+        useSpeakerphone = sharedPreferences.getBoolean("USE_SPEAKERPHONE", true)
 
         checkAndRequestPermissions()
     }
 
     @SuppressLint("NewApi")
     private fun setupAudioSystem() {
+        // First set the audio mode
         audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
-        @Suppress("DEPRECATION")
-        audioManager.isSpeakerphoneOn = false
 
+        // Request audio focus before setting up audio routing
         val focusRequest =
             AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE)
                 .setAudioAttributes(
@@ -172,7 +177,28 @@ class AssistantActivity : AppCompatActivity() {
                 .build()
 
         audioFocusRequest = focusRequest
-        audioManager.requestAudioFocus(focusRequest)
+        val result = audioManager.requestAudioFocus(focusRequest)
+        
+        if (result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                val devices = audioManager.availableCommunicationDevices
+                val targetDevice = if (useSpeakerphone) {
+                    devices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
+                } else {
+                    devices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_EARPIECE }
+                } ?: devices.firstOrNull()
+
+                targetDevice?.let { device ->
+                    audioManager.setCommunicationDevice(device)
+                }
+            } else {
+                @Suppress("DEPRECATION")
+                audioManager.isSpeakerphoneOn = useSpeakerphone
+            }
+
+            // Set the volume control stream
+            volumeControlStream = AudioManager.STREAM_VOICE_CALL
+        }
     }
 
     override fun onResume() {
@@ -240,6 +266,12 @@ class AssistantActivity : AppCompatActivity() {
             audioSequence = 0 // Reset audio sequence number
             audioDataQueue.clear() // Clear any buffered audio data
         }
+
+        // Keep the screen on while the assistant is running
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+
+        // Initialize audio system
+        setupAudioSystem()
 
         fetchJwtToken { jwtToken ->
             if (jwtToken != null) {
@@ -543,6 +575,7 @@ class AssistantActivity : AppCompatActivity() {
             AudioAttributes.Builder()
                 .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
                 .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                .setFlags(AudioAttributes.FLAG_AUDIBILITY_ENFORCED)  // Add this flag
                 .build(),
             AudioFormat.Builder()
                 .setEncoding(AUDIO_FORMAT)
@@ -551,9 +584,8 @@ class AssistantActivity : AppCompatActivity() {
                 .build(),
             bufferSize,
             AudioTrack.MODE_STREAM,
-            audioManager.generateAudioSessionId()
+            audioManager.generateAudioSessionId()  // Use a new session ID
         ).apply {
-            //setVolume(0.8f)
             play()
         }
     }
@@ -644,10 +676,16 @@ class AssistantActivity : AppCompatActivity() {
         webSocket?.close(1000, null)
         webSocket = null
 
-        audioManager.mode = AudioManager.MODE_NORMAL
-        @Suppress("DEPRECATION")
-        audioManager.isSpeakerphoneOn = true
+        // Clear the keep screen on flag
+        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
+        // Reset audio mode and abandon audio focus
+        audioManager.mode = AudioManager.MODE_NORMAL
+        
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            audioManager.clearCommunicationDevice()
+        }
+        
         audioFocusRequest?.let { request ->
             audioManager.abandonAudioFocusRequest(request)
         }
@@ -673,9 +711,6 @@ class AssistantActivity : AppCompatActivity() {
     override fun onPause() {
         super.onPause()
         stopAssistant()
-        if (wakeLock.isHeld) {
-            wakeLock.release()
-        }
     }
 
     @SuppressLint("Wakelock")
