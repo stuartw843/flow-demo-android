@@ -49,6 +49,7 @@ android {
 dependencies {
     implementation(libs.androidx.espresso.core.v361)
     implementation(libs.androidx.espresso.core.v361)
+    implementation(libs.androidx.preference.ktx)
     val composeBomVersion = "2023.08.00"
     
     implementation(platform(libs.androidx.compose.bom.v20230800))
