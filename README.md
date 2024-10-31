@@ -57,6 +57,31 @@ To set Flow Assistant as your default digital assistant on the latest Android ph
 
 Note: The exact steps might vary slightly depending on your Android device manufacturer and version.
 
+### Configuring the Application
+
+#### Setting up the API Key
+
+1. Launch Flow Assistant or tap the settings icon (three dots) in the top-right corner
+2. In the settings menu, locate the "API Key" field
+3. Enter your Speechmatics Flow API key
+4. Tap "Save" to store your API key securely
+
+Note: Your API key will be securely stored and used for all future conversations. You only need to set this once unless you want to use a different key.
+
+#### Speaker Phone Settings
+
+Flow Assistant includes a speaker phone toggle that controls how audio is played:
+
+- When enabled (ON): Audio will play through the device's speaker, making it suitable for hands-free use or when you want others to hear the assistant's responses
+- When disabled (OFF): Audio will play through the device's earpiece, providing more privacy for your conversations
+
+To adjust the speaker phone setting:
+1. Open Flow Assistant or tap the settings icon (three dots)
+2. Find the "Use Speaker Phone" toggle
+3. Switch it ON or OFF according to your preference
+
+The speaker phone setting will be remembered for future conversations until you change it again.
+
 ## Speechmatics Flow Integration
 
 ### Getting Started with Speechmatics Flow
