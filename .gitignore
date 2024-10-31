@@ -38,7 +38,6 @@ app/src/main/res/mipmap-xxxhdpi/ic_launcher.webp
 app/src/main/res/xml/backup_rules.xml
 app/src/main/res/xml/data_extraction_rules.xml
 app/src/test/java/com/example/flowassistant/ExampleUnitTest.kt
-gradle/libs.versions.toml
 gradle/wrapper/gradle-wrapper.jar
 .gitignore
 .idea/.gitignore
