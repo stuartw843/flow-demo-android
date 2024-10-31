@@ -7,6 +7,8 @@ All code in this application was generated using OpenAI's o1-preview model and i
 ## Features
 
 - Real-time speech-to-speech conversation
+- Can replace the default Android Assistant
+- Can run from the lock screen
 - Automatic handling of interruptions
 - Support for multiple speakers
 - Understanding of different dialects and accents
@@ -41,6 +43,19 @@ All code in this application was generated using OpenAI's o1-preview model and i
    - Connect your Android device to your computer via USB
    - Allow USB debugging when prompted on your device
    - Your device should appear in Android Studio's device dropdown menu
+
+### Setting as Default Assistant
+
+To set Flow Assistant as your default digital assistant on the latest Android phones:
+
+1. Go to your device's Settings
+2. Scroll down and tap on "Apps" or "Applications"
+3. Tap on "Default apps" or "Choose default apps"
+4. Look for "Digital assistant app" or "Default digital assistant app"
+5. Select "Flow Assistant" from the list of available assistants
+6. Optional: Enable "Use while device is locked" if you want to access the assistant from the lock screen
+
+Note: The exact steps might vary slightly depending on your Android device manufacturer and version.
 
 ## Speechmatics Flow Integration
 
