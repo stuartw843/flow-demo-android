@@ -41,6 +41,7 @@ import java.io.IOException
 import java.util.*
 import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
 
 class AssistantActivity : AppCompatActivity() {
 
@@ -65,7 +66,9 @@ class AssistantActivity : AppCompatActivity() {
     private var isRecording = false
     @Volatile
     private var webSocket: WebSocket? = null
-    private val client = OkHttpClient()
+    private val client = OkHttpClient.Builder()
+        .readTimeout(0, TimeUnit.MILLISECONDS)
+        .build()
     private val executorService = Executors.newFixedThreadPool(2)
     private lateinit var audioManager: AudioManager
     private var audioFocusRequest: AudioFocusRequest? = null
@@ -102,9 +105,11 @@ class AssistantActivity : AppCompatActivity() {
     // Variables for handling audio sequence numbers
     private var audioSequence = 0
 
-    // Flag to indicate if the conversation has started
+    // Flags for buffering and conversation state
     @Volatile
     private var isConversationStarted = false
+    @Volatile
+    private var isBufferingAudioData = true
 
     // Queue to buffer audio data until conversation starts
     private val audioDataQueue = LinkedBlockingQueue<ByteArray>()
@@ -186,7 +191,7 @@ class AssistantActivity : AppCompatActivity() {
 
         audioFocusRequest = focusRequest
         val result = audioManager.requestAudioFocus(focusRequest)
-        
+
         if (result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                 val devices = audioManager.availableCommunicationDevices
@@ -271,6 +276,7 @@ class AssistantActivity : AppCompatActivity() {
             }
             isAssistantRunning = true
             isConversationStarted = false // Reset the flag
+            isBufferingAudioData = true   // Start buffering audio data
             audioSequence = 0 // Reset audio sequence number
             audioDataQueue.clear() // Clear any buffered audio data
         }
@@ -283,12 +289,13 @@ class AssistantActivity : AppCompatActivity() {
         // Initialize audio system
         setupAudioSystem()
 
+        // Start recording immediately
+        startRecording()
+
         fetchJwtToken { jwtToken ->
             if (jwtToken != null) {
                 startWebSocket(jwtToken)
                 updateStatusText("Connecting...")
-                // Start recording, but don't send data yet
-                startRecording()
             } else {
                 updateStatusText("Error fetching token")
                 isAssistantRunning = false
@@ -532,9 +539,15 @@ class AssistantActivity : AppCompatActivity() {
                     if (read > 0) {
                         val data = buffer.copyOf(read)
                         if (isConversationStarted) {
-                            sendAudioData(data)
+                            if (isBufferingAudioData) {
+                                // Buffer new data until we catch up
+                                audioDataQueue.offer(data)
+                            } else {
+                                // Send data immediately
+                                sendAudioData(data)
+                            }
                         } else {
-                            // Buffer the data until conversation starts
+                            // Buffer data
                             audioDataQueue.offer(data)
                         }
                     }
@@ -566,7 +579,7 @@ class AssistantActivity : AppCompatActivity() {
                     }
                 }
             } else {
-                // Buffer the data if conversation hasn't started yet
+                // Buffer the data if conversation hasn't started yet or if we're still buffering
                 audioDataQueue.offer(data)
             }
         } catch (e: Exception) {
@@ -586,10 +599,13 @@ class AssistantActivity : AppCompatActivity() {
                     val data = audioDataQueue.poll()
                     if (data != null) {
                         sendAudioData(data)
+                        // Send data as fast as possible
                     } else {
                         break
                     }
                 }
+                // After sending all buffered data
+                isBufferingAudioData = false
             } catch (e: Exception) {
                 e.printStackTrace()
                 Log.e("AssistantActivity", "Error sending buffered audio data: ${e.message}")
@@ -754,7 +770,7 @@ class AssistantActivity : AppCompatActivity() {
 
         if (seconds > 0) {
             val intent = Intent(AlarmClock.ACTION_SET_TIMER).apply {
-                flags = Intent.FLAG_ACTIVITY_NEW_TASK or 
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or
                         Intent.FLAG_ACTIVITY_NO_HISTORY or
                         Intent.FLAG_ACTIVITY_MULTIPLE_TASK or
                         Intent.FLAG_ACTIVITY_NO_USER_ACTION or
@@ -763,7 +779,7 @@ class AssistantActivity : AppCompatActivity() {
                 putExtra(AlarmClock.EXTRA_SKIP_UI, true)  // Skip UI to keep voice session in front
                 putExtra(AlarmClock.EXTRA_MESSAGE, "Timer for $duration $unit")
             }
-            
+
             try {
                 startActivity(intent)
                 // Bring our activity back to front immediately
@@ -771,7 +787,7 @@ class AssistantActivity : AppCompatActivity() {
                     flags = Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
                 }
                 startActivity(bringToFrontIntent)
-                
+
                 // Send success response
                 val response = JSONObject().apply {
                     put("message", "ToolResult")
@@ -822,7 +838,7 @@ class AssistantActivity : AppCompatActivity() {
                 alarmManager.cancel(pendingIntent)
                 pendingIntent.cancel()
             }
-            
+
             // Send success response
             val response = JSONObject().apply {
                 put("message", "ToolResult")
@@ -859,7 +875,7 @@ class AssistantActivity : AppCompatActivity() {
             }
             isAssistantRunning = false
         }
-        
+
         // Non-UI operations first
         stopRecording()
         sendAudioEndedMessage()
@@ -874,11 +890,11 @@ class AssistantActivity : AppCompatActivity() {
 
         // Audio operations
         audioManager.mode = AudioManager.MODE_NORMAL
-        
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             audioManager.clearCommunicationDevice()
         }
-        
+
         audioFocusRequest?.let { request ->
             audioManager.abandonAudioFocusRequest(request)
         }
@@ -913,7 +929,7 @@ class AssistantActivity : AppCompatActivity() {
         }
     }
 
-@SuppressLint("Wakelock")
+    @SuppressLint("Wakelock")
     override fun onDestroy() {
         super.onDestroy()
         stopAssistant()
@@ -928,7 +944,7 @@ class AssistantActivity : AppCompatActivity() {
         return true
     }
 
-override fun onOptionsItemSelected(item: MenuItem): Boolean {
+    override fun onOptionsItemSelected(item: MenuItem): Boolean {
         return when (item.itemId) {
             R.id.action_settings -> {
                 val intent = Intent(this, SettingsActivity::class.java)
