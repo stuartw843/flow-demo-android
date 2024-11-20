@@ -291,11 +291,11 @@ class AssistantActivity : AppCompatActivity() {
 
         // Start recording immediately
         startRecording()
+        updateStatusText("Listening...")
 
         fetchJwtToken { jwtToken ->
             if (jwtToken != null) {
                 startWebSocket(jwtToken)
-                updateStatusText("Connecting...")
             } else {
                 updateStatusText("Error fetching token")
                 isAssistantRunning = false
