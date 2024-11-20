@@ -1,3 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
 <!-- File: app/src/main/AndroidManifest.xml -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.example.flowassistant">
@@ -13,6 +14,12 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <!-- Requires user action to grant permission -->
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <!-- Alarm permissions -->
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+    <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
+    <uses-permission android:name="com.android.alarm.permission.SET_ALARM" />
+    <!-- Background activity start permission -->
+    <uses-permission android:name="android.permission.ALLOW_BACKGROUND_ACTIVITY_STARTS" />
 
     <application
         android:label="Flow Assistant"

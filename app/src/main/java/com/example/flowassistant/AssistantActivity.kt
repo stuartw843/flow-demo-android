@@ -1,9 +1,10 @@
-// File: app/src/main/java/com/example/flowassistant/AssistantActivity.kt
 package com.example.flowassistant
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.app.AlarmManager
 import android.app.KeyguardManager
+import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -15,6 +16,8 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
+import android.os.SystemClock
+import android.provider.AlarmClock
 import android.util.Base64
 import android.util.Log
 import android.view.Menu
@@ -32,6 +35,7 @@ import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.RequestBody.Companion.toRequestBody
 import okio.ByteString
 import okio.ByteString.Companion.toByteString
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
 import java.util.*
@@ -73,6 +77,8 @@ class AssistantActivity : AppCompatActivity() {
     // Assistant State
     @Volatile
     private var isAssistantRunning = false
+    @Volatile
+    private var isHandlingTimerAction = false
 
     // Shared Preferences
     private val sharedPreferences by lazy {
@@ -170,7 +176,9 @@ class AssistantActivity : AppCompatActivity() {
                     when (focusChange) {
                         AudioManager.AUDIOFOCUS_LOSS,
                         AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
-                            stopAssistant()
+                            Handler(Looper.getMainLooper()).post {
+                                stopAssistant()
+                            }
                         }
                     }
                 }
@@ -268,7 +276,9 @@ class AssistantActivity : AppCompatActivity() {
         }
 
         // Keep the screen on while the assistant is running
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        runOnUiThread {
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
 
         // Initialize audio system
         setupAudioSystem()
@@ -364,7 +374,9 @@ class AssistantActivity : AppCompatActivity() {
                 } else {
                     Log.e("AssistantActivity", "Max retries reached. Stopping assistant.")
                     isAssistantRunning = false
-                    stopAssistant()
+                    Handler(Looper.getMainLooper()).post {
+                        stopAssistant()
+                    }
                 }
             }
 
@@ -372,22 +384,69 @@ class AssistantActivity : AppCompatActivity() {
                 Log.d("AssistantActivity", "WebSocket is closing: $reason")
                 isAssistantRunning = false
                 webSocket.close(1000, null)
-                stopAssistant()
+                Handler(Looper.getMainLooper()).post {
+                    stopAssistant()
+                }
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                 Log.d("AssistantActivity", "WebSocket closed: $reason")
                 isAssistantRunning = false
-                stopAssistant()
+                Handler(Looper.getMainLooper()).post {
+                    stopAssistant()
+                }
             }
         })
     }
 
     private fun sendStartConversationMessage() {
+        val tools = JSONArray().apply {
+            put(JSONObject().apply {
+                put("type", "function")
+                put("function", JSONObject().apply {
+                    put("name", "set_timer")
+                    put("description", "Set a timer for a specified duration")
+                    put("parameters", JSONObject().apply {
+                        put("type", "object")
+                        put("properties", JSONObject().apply {
+                            put("duration", JSONObject().apply {
+                                put("type", "integer")
+                                put("description", "Duration value")
+                            })
+                            put("unit", JSONObject().apply {
+                                put("type", "string")
+                                put("description", "Time unit (seconds, minutes, hours)")
+                                put("enum", JSONArray().apply {
+                                    put("seconds")
+                                    put("minutes")
+                                    put("hours")
+                                })
+                            })
+                        })
+                        put("required", JSONArray().apply {
+                            put("duration")
+                            put("unit")
+                        })
+                    })
+                })
+            })
+            put(JSONObject().apply {
+                put("type", "function")
+                put("function", JSONObject().apply {
+                    put("name", "cancel_timer")
+                    put("description", "Cancel and delete all running timers")
+                    put("parameters", JSONObject().apply {
+                        put("type", "object")
+                        put("properties", JSONObject())
+                    })
+                })
+            })
+        }
+
         val message = JSONObject().apply {
             put("message", "StartConversation")
             put("conversation_config", JSONObject().apply {
-                put("template_id", "default") // You can change this to use a selected persona if needed
+                put("template_id", "default")
                 put("template_variables", JSONObject().apply {
                     put("timezone", TimeZone.getDefault().id)
                 })
@@ -397,6 +456,7 @@ class AssistantActivity : AppCompatActivity() {
                 put("encoding", "pcm_s16le")
                 put("sample_rate", SAMPLE_RATE)
             })
+            put("tools", tools)
         }
         val messageString = message.toString()
         Log.d("AssistantActivity", "Sending StartConversation message: $messageString")
@@ -486,7 +546,9 @@ class AssistantActivity : AppCompatActivity() {
                 isRecording = false
                 isAssistantRunning = false
                 updateStatusText("Error reading audio data: ${e.message}")
-                stopAssistant()
+                Handler(Looper.getMainLooper()).post {
+                    stopAssistant()
+                }
             }
         }
     }
@@ -499,7 +561,9 @@ class AssistantActivity : AppCompatActivity() {
                 if (!sent) {
                     Log.e("AssistantActivity", "Failed to send data over WebSocket.")
                     updateStatusText("Failed to send audio data.")
-                    stopAssistant()
+                    Handler(Looper.getMainLooper()).post {
+                        stopAssistant()
+                    }
                 }
             } else {
                 // Buffer the data if conversation hasn't started yet
@@ -509,7 +573,9 @@ class AssistantActivity : AppCompatActivity() {
             e.printStackTrace()
             Log.e("AssistantActivity", "Exception in sendAudioData: ${e.message}")
             updateStatusText("Error sending data: ${e.message}")
-            stopAssistant()
+            Handler(Looper.getMainLooper()).post {
+                stopAssistant()
+            }
         }
     }
 
@@ -528,7 +594,9 @@ class AssistantActivity : AppCompatActivity() {
                 e.printStackTrace()
                 Log.e("AssistantActivity", "Error sending buffered audio data: ${e.message}")
                 updateStatusText("Error sending audio data.")
-                stopAssistant()
+                Handler(Looper.getMainLooper()).post {
+                    stopAssistant()
+                }
             }
         }
     }
@@ -613,12 +681,31 @@ class AssistantActivity : AppCompatActivity() {
                 val errorMsg = json.optString("reason")
                 updateStatusText("Error: $errorMsg")
                 Log.e("AssistantActivity", "Received error message: $errorMsg")
-                stopAssistant()
+                Handler(Looper.getMainLooper()).post {
+                    stopAssistant()
+                }
             }
             "ConversationEnded" -> {
                 updateStatusText("Conversation ended")
                 Log.d("AssistantActivity", "Conversation ended.")
-                stopAssistant()
+                Handler(Looper.getMainLooper()).post {
+                    stopAssistant()
+                }
+            }
+            "ToolInvoke" -> {
+                val id = json.optString("id")
+                val function = json.optJSONObject("function")
+                when (function?.optString("name")) {
+                    "set_timer" -> {
+                        val args = function.optJSONObject("arguments")
+                        val duration = args?.optInt("duration", 0) ?: 0
+                        val unit = args?.optString("unit", "") ?: ""
+                        handleSetTimer(id, duration, unit)
+                    }
+                    "cancel_timer" -> {
+                        handleCancelTimer(id)
+                    }
+                }
             }
             else -> {
                 // Handle other messages
@@ -656,6 +743,107 @@ class AssistantActivity : AppCompatActivity() {
         }
     }
 
+    private fun handleSetTimer(id: String, duration: Int, unit: String) {
+        isHandlingTimerAction = true
+        val seconds = when (unit) {
+            "seconds" -> duration
+            "minutes" -> duration * 60
+            "hours" -> duration * 3600
+            else -> 0
+        }
+
+        if (seconds > 0) {
+            val intent = Intent(AlarmClock.ACTION_SET_TIMER).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or 
+                        Intent.FLAG_ACTIVITY_NO_HISTORY or
+                        Intent.FLAG_ACTIVITY_MULTIPLE_TASK or
+                        Intent.FLAG_ACTIVITY_NO_USER_ACTION or
+                        Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS
+                putExtra(AlarmClock.EXTRA_LENGTH, seconds)
+                putExtra(AlarmClock.EXTRA_SKIP_UI, true)  // Skip UI to keep voice session in front
+                putExtra(AlarmClock.EXTRA_MESSAGE, "Timer for $duration $unit")
+            }
+            
+            try {
+                startActivity(intent)
+                // Bring our activity back to front immediately
+                val bringToFrontIntent = Intent(this, AssistantActivity::class.java).apply {
+                    flags = Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
+                }
+                startActivity(bringToFrontIntent)
+                
+                // Send success response
+                val response = JSONObject().apply {
+                    put("message", "ToolResult")
+                    put("id", id)
+                    put("status", "ok")
+                    put("content", "Timer set for $duration $unit")
+                }
+                webSocket?.send(response.toString())
+            } catch (e: Exception) {
+                // Send error response if the clock app is not available
+                val response = JSONObject().apply {
+                    put("message", "ToolResult")
+                    put("id", id)
+                    put("status", "failed")
+                    put("content", "Could not launch timer: ${e.message}")
+                }
+                webSocket?.send(response.toString())
+            }
+        } else {
+            // Send error response for invalid duration
+            val response = JSONObject().apply {
+                put("message", "ToolResult")
+                put("id", id)
+                put("status", "failed")
+                put("content", "Invalid timer duration or unit")
+            }
+            webSocket?.send(response.toString())
+        }
+        isHandlingTimerAction = false
+    }
+
+    private fun handleCancelTimer(id: String) {
+        isHandlingTimerAction = true
+        try {
+            val alarmManager = getSystemService(Context.ALARM_SERVICE) as AlarmManager
+            // Create an intent similar to what's used for setting timers
+            val timerIntent = Intent(AlarmClock.ACTION_SET_TIMER).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK
+            }
+            // Cancel any pending intents that match this timer intent
+            val pendingIntent = PendingIntent.getActivity(
+                this,
+                0,
+                timerIntent,
+                PendingIntent.FLAG_NO_CREATE or PendingIntent.FLAG_IMMUTABLE
+            )
+            if (pendingIntent != null) {
+                alarmManager.cancel(pendingIntent)
+                pendingIntent.cancel()
+            }
+            
+            // Send success response
+            val response = JSONObject().apply {
+                put("message", "ToolResult")
+                put("id", id)
+                put("status", "ok")
+                put("content", "Cancelled all timers")
+            }
+            webSocket?.send(response.toString())
+        } catch (e: Exception) {
+            // Send error response if cancellation fails
+            val response = JSONObject().apply {
+                put("message", "ToolResult")
+                put("id", id)
+                put("status", "failed")
+                put("content", "Could not cancel timers: ${e.message}")
+            }
+            webSocket?.send(response.toString())
+        }
+        isHandlingTimerAction = false
+    }
+
     private fun updateStatusText(status: String) {
         runOnUiThread {
             binding.statusText.text = status
@@ -671,15 +859,20 @@ class AssistantActivity : AppCompatActivity() {
             }
             isAssistantRunning = false
         }
+        
+        // Non-UI operations first
         stopRecording()
         sendAudioEndedMessage()
         webSocket?.close(1000, null)
         webSocket = null
 
-        // Clear the keep screen on flag
-        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        // UI operations wrapped in runOnUiThread
+        runOnUiThread {
+            // Clear the keep screen on flag
+            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
 
-        // Reset audio mode and abandon audio focus
+        // Audio operations
         audioManager.mode = AudioManager.MODE_NORMAL
         
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -692,7 +885,11 @@ class AssistantActivity : AppCompatActivity() {
 
         // Release wake lock if held
         if (wakeLock.isHeld) {
-            wakeLock.release()
+            try {
+                wakeLock.release()
+            } catch (e: Exception) {
+                Log.e("AssistantActivity", "Error releasing wake lock: ${e.message}")
+            }
         }
 
         Log.d("AssistantActivity", "Assistant stopped.")
@@ -710,10 +907,13 @@ class AssistantActivity : AppCompatActivity() {
 
     override fun onPause() {
         super.onPause()
-        stopAssistant()
+        // Only stop assistant if we're not handling a timer action
+        if (!isHandlingTimerAction) {
+            stopAssistant()
+        }
     }
 
-    @SuppressLint("Wakelock")
+@SuppressLint("Wakelock")
     override fun onDestroy() {
         super.onDestroy()
         stopAssistant()
@@ -728,7 +928,7 @@ class AssistantActivity : AppCompatActivity() {
         return true
     }
 
-    override fun onOptionsItemSelected(item: MenuItem): Boolean {
+override fun onOptionsItemSelected(item: MenuItem): Boolean {
         return when (item.itemId) {
             R.id.action_settings -> {
                 val intent = Intent(this, SettingsActivity::class.java)
